@@ -1,0 +1,462 @@
+---
+title: "Time Series: Analysis and Prediction"
+subtitle: "Progetto di Streaming Data Management and Time Series Analysis"
+author: "Alberto Filosa"
+date: "15/01/2021"
+output: 
+  rmdformats::downcute:
+    self_contained: true
+---
+
+```{r Setup, include = FALSE}
+knitr::opts_chunk$set(fig.align = "center",
+                      echo = FALSE,
+                      out.width = "100%",
+                      warning = FALSE,
+                      message = FALSE)
+
+load("G:/Il mio Drive/Università/Data Science/2° Anno/Streaming Data Management and Time Series Analysis/Esame/Oggetti/all.RData")
+```
+
+```{r Libraries, include FALSE}
+library("tidyverse") #-- Manipulation
+library("xts") 
+library("forecast") #-- Time Series Forecast
+library("KFAS") #-- UCM 
+library("lubridate") #-- Manipulation for Dates
+library("astsa")
+library("dygraphs") #-- Dynamic Graphs
+library("ggpubr")
+```
+
+# Introduzione
+Lo scopo del progetto è analizzare una serie storica giornaliera a partire dal 1° Settembre 2018 fino al 31 Agosto 2020. Successivamente è necessario compiere una previsione oraria dei valori nei mesi di Settembre ed Ottobre 2020 attraverso l'uso di modelli statistici quali ***A***uto***R***egressive ***I***ntegrated ***M***oving ***A***verage (**ARIMA**), ***U***nobserved ***C***omoponents ***M***odels (**UCM**) e ***R***ecurrent ***N***eural ***N***etwork (**RNN**).
+
+Il confronto tra di essi avverrà tramite la metrica MAE e graficamente visualizzando le previsioni i primi e gli ultimi giorni, sia sul dataset di Train sia di Validation.
+
+Si presenta il grafico interattivo della serie storica considerata. In questo modo è possibile selezionare con lo slider il periodo preciso ed identificare con precisione i valori.
+
+```{r Time Series Plot, include = TRUE}
+dygraph(dyn_all)                             %>%
+  dySeries("Train",
+           label = "Train")                  %>% #-- Train Dataset
+  dySeries("Validation",
+           label = "Validation")             %>% #-- Validation Dataset
+  dyOptions(drawPoints = TRUE,                   #-- Draw Points
+            pointSize = 0.5,                     #-- Size of Points
+            colors = c("#0077b6",
+                       "#c44536"))               %>% #-- Colori
+  dyAxis("y", label = "Valore (in Milioni)") %>% #-- Asse Y
+  dyAxis("x", label = "Periodo",
+         drawGrid = FALSE)                   %>% #-- Asse X
+  dyRangeSelector(height = 20)                   #-- Slider
+```
+
+Per realizzare la previsione dei dati sconosciuti nel periodo compreso tra il 1° Settembre 2020 ed il 31 Ottobre 2020 è necessario dividere la serie storica in due parti:
+
+* *Training Set*, che consiste nell'80% dei dati, dal `1° Settembre 2018` a `7 Aprile 2020`;
+* *Validation Set*, che consiste nel 20 % dei dati, dal `7 Aprile 2020` a `31 Agosto 2020`. Su di essa verranno confrontate i metodi di previsione ed osservare l'adattabilità del modello alla serie storica.
+
+# Analisi Esplorativa
+Prima di procedere alla costruzione dei modelli, si sono individuati i possibili valori mancanti dovuti allo spostamento d'ora legato all'ora legale. Si sono identificati i giorni in cui ci sono state meno ore:
+
+```{r Legal Hours}
+ts_noleg <- read_csv2("G:\\Il mio Drive\\Università\\Data Science\\2° Anno\\Streaming Data Management and Time Series Analysis\\Esame\\TrainingSet.csv")
+
+ts_noleg <- ts_noleg %>%
+  rename(Data = DATA,
+         Valore = VALORE)
+
+knitr::kable(ts_noleg                %>%
+  group_by(year(date(Data)),
+           month(date(Data)),
+           day(date(Data)))          %>% #-- Raggruppamento
+  summarise(n())                     %>% #-- Somma per Righe
+  filter(`n()` == 23)                %>% #-- Filtro (Ora Legale)
+  rename(Year = "year(date(Data))",
+        Month = "month(date(Data))",
+        Day = "day(date(Data))",
+        `Day Hours` = "n()"),            #-- Rinomina Colonne
+  caption = "Problemi Ora Legale")
+```
+
+Il `31 Marzo 2019` e `29 Marzo 2020` sono i giorni in cui si è cambiata l'ora legale. Per non avere valori mancanti, si è deciso di inserire a mano i valori dell'ora precedente. Infine, si è deciso di standardizzare i valori per ridurre i tempi di calcolo dei modelli. Alla fine, essi verranno riscalati con i valori iniziali.
+
+## Stagionalità 
+Si costruiscono le Time Series giornaliere, settimanali, mensili ed annuali per individuare per ognuna di esse una possibile stagionalità. Gli ultimi due oggetti sono stati aggregati in termini medi i valori. Dal grafico è possibile osservare una stagionalità giornaliera, in quanto  i valori aumentano nelle ore del giorno lavorativo e diminuiscono nella pausa pranzo, a fine orario lavorativo e di notte. Il settimanale conferma quanto detto precedentemente; inoltre, si osserva un leggero trend crescente da inizio a fine settimana. Non è presente stagionalità mensile, in quanto non esiste un pattern uguale per tutti i mesi. Infine, è possibile notare una lieve stagionalità annuale.
+
+```{r Daily Seasonality}
+gg_daily <- ggseasonplot(ts_daily[, "Valore"],                      #-- Stagionalità Giornaliera
+             year.labels = TRUE,                        #-- Etichetta
+             year.labels.left = FALSE,                  #-- Etichetta
+             ylab = "Valore (in milioni)",              #-- Etichetta Asse Y
+             xlab = "Orario del Giorno",                #-- Etichetta Asse X
+             main = "Grafico Stagionale Giornaliero") + #-- Titolo
+  theme(axis.text.y = element_text(face = "bold"),      #-- Grassetto per Asse Y
+        axis.text.x = element_text(face = "bold",       #-- Grassetto per Asse X
+                                   angle = 45)) +       #-- 45°
+  scale_y_continuous(breaks = c(2000000,
+                                4000000,
+                                6000000,
+                                8000000),               #-- Interruzioni
+                     labels = c(2,4,6,8)) +             #-- Etichetta
+  theme_bw()                                            #-- Tema
+```
+
+```{r Weekly Seasonality}
+gg_weekly <- ggseasonplot(ts_weekly[, "Valore"],                     #-- Stagionalità Settimanale
+             year.labels = TRUE,                        #-- Etichetta
+             year.labels.left = FALSE,                  #-- Etichetta
+             ylab = "Valore (in milioni)",              #-- Etichetta Asse Y
+             xlab = "Giorni in una Settimana",          #-- Etichetta Asse X
+             main = "Grafico Stagionale Settimanale") + #-- Titolo
+  theme(axis.text.y = element_text(face = "bold"),      #-- Grassetto per Asse Y
+        axis.text.x = element_text(face = "bold",       #-- Grassetto per Asse X
+                                   angle = 45)) +       #-- 45°
+  scale_y_continuous(breaks = c(2000000,
+                                4000000,
+                                6000000,
+                                8000000),               #-- Interruzioni
+                     labels = c(2,4,6,8)) +             #-- Etichetta
+  theme_bw()                                            #-- Tema
+```
+
+```{r Monthly Seasonality}
+gg_monthly <- ggseasonplot(ts(ag[,"Valore"], frequency = 30),         #-- Stagionalità Mensile
+             year.labels = TRUE,                        #-- Etichetta
+             year.labels.left = FALSE,                  #-- Etichetta
+             ylab = "Valore (in milioni)",              #-- Etichetta Asse Y
+             xlab = "Giorni in un Mese",                #-- Etichetta Asse X
+             main = "Grafico Stagionale Mensile") +     #-- Titolo
+  theme(axis.text.y = element_text(face = "bold"),      #-- Grassetto per Asse Y
+        axis.text.x = element_text(face = "bold",       #-- Grassetto per Asse X
+                                   angle = 45)) +       #-- 45°
+  scale_y_continuous(breaks = c(3000000,
+                                4000000,
+                                5000000,
+                                6000000),               #-- Interruzioni
+                     labels = c(3,4,5,6)) +             #-- Etichetta
+  theme_bw()                                            #-- Tema
+```
+
+```{r Yearly Seasonality}
+gg_yearly <- ggseasonplot(ts(ag[,"Valore"], frequency = 730/2),      #-- Stagionalità Annuale
+             year.labels = TRUE,                        #-- Etichetta
+             year.labels.left = FALSE,                  #-- Etichetta
+             ylab = "Valore (in milioni)",              #-- Etichetta Asse Y
+             xlab = "Giorni in un Anno",                #-- Etichetta Asse X
+             main = "Grafico Stagionale Annuale") +     #-- Titolo
+  theme(axis.text.y = element_text(face = "bold"),      #-- Grassetto per Asse Y
+        axis.text.x = element_text(face = "bold",       #-- Grassetto per Asse X
+                                   angle = 45)) +       #-- 45°
+  scale_y_continuous(breaks = c(3000000,
+                                4000000,
+                                5000000,
+                                6000000),               #-- Interruzioni
+                     labels = c(3,4,5,6)) +             #-- Etichetta
+  theme_bw()                                            #-- Tema
+```
+
+```{r All Seasonality, fig.cap = "Stagionalità Serie Storica"}
+ggarrange(gg_daily,
+          gg_weekly,
+          gg_monthly,
+          gg_yearly,
+          nrow = 2, ncol = 2)
+```
+
+# Seasonal Naive Method
+Si è deciso di costruire un modello iniziale semplice: il *Seasonal Naive Method*. In particolare, si assegna ad ogni previsione l'ultimo valore osservato della stagionalità precedente. Questo modello può essere utilizzato come benchmark rispetto ad altri modelli molto più complessi: talvolta i modelli più semplici sono anche i migliori. [^1]
+
+```{r SNaive, fig.cap = "Previsioni Seasonal Naive Method"}
+plot_val(snaive(train_arima,
+                h = 3504)$mean, "Previsioni Seasonal Naive Method")
+```
+
+Dal grafico è possibile notare che la previsione sul validation riesce ad individuare discretamente la stagionalità, ma non il trend della serie storica.
+
+# Arima
+La procedura Box - Jenkins prevede l'analisi dei correlogrammi ACF e PACF della serie storica in modo da determinare i parametri del modello ARIMA. Dai seguenti grafici è possibile confermare la presenza di stagionalità giornaliera, in quanto ogni giorno si osservano picchi molto alti ogni due - tre ritardi.
+
+```{r ACF e PACF Plots, fig.cap = "Correlogrammi Serie Storica", out.width = "75%"}
+ggarrange(ggAcf(ts[, "Valore"],
+                lag.max = 48,        #-- 2 Days for Seasonality
+                main = ""),
+          ggPacf(ts[, "Valore"],
+                 lag.max = 48,       #-- 2 Days for Seasonality
+                 main = ""),
+          labels = c("ACF", "PACF"),
+          nrow = 2, ncol= 1)
+```
+
+Inoltre, si osserva che la serie storica non è stazionaria in varianza. Si è deciso, di conseguenza, di differenziare stagionalmente i valori ogni 24 ore e differenziare al secondo ordine per eliminare il trend per far sì che la serie storica sia White Noise.
+
+```{r ACF e PACF Giornaliere, fig.cap = "Correlogrammi Serie Storica Differenziata", out.width = "75%"}
+ggarrange(acf_diff,
+          pacf_diff,
+          labels = c("ACF", "PACF"),
+          nrow = 2, ncol = 1)
+```
+
+Come prima ipotesi, si applica un modello ARIMA con una differenziazione giornaliera con parametro Auto Regressivo pari a 2. Il modello costruito è il seguente: *ARIMA*$(2, 0, 0)(0, 1, 0)_{24}$.
+
+```{r ACF e PACF Arima 1, fig.cap = "Correlogrammi *ARIMA*$(2, 0, 0)(0, 1, 0)_{24}$", out.width = "75%"}
+ggarrange(acf_arima1,
+          pacf_arima1,
+          labels = c("ACF", "PACF"),
+          nrow = 2,
+          ncol= 1)
+```
+
+Il primo modello presenta una stagionalità nella Moving Average in quanto nei grafici ACF e PACF sono presenti dei lag multipli di 24 ore superiori all'intervallo di confidenza (per ulteriori analisi dei modelli, si riporta il notebook in allegato). Si costruisce il seguente modello: *ARIMA*$(2, 0, 0)(0, 1, 1)_{24}$. 
+
+```{r ACF e PACF Arima 2, fig.cap = "Correlogrammi *ARIMA*$(2, 0, 0)(0, 1, 1)_{24}$", out.width = "75%"}
+ggarrange(acf_arima2,
+          pacf_arima2,
+          labels = c("ACF", "PACF"),
+          nrow = 2,
+          ncol= 1)
+```
+
+I valori dei ritardi sono diminuiti, ma si nota ancora una stagionalità nella parte di Media Mobile del modello. Inoltre, si nota un picco relativamente alto nel terzo ritardo nella PACF, di conseguenza si aumenta il parametro AR del modello. Si costruisce il seguente modello: *ARIMA*$(3, 0, 0)(0, 1, 2)_{24}$.
+
+```{r ACF e PACF Arima 4, fig.cap = "Correlogrammi *ARIMA*$(3, 0, 0)(0, 1, 2)_{24}$", out.width = "75%"}
+ggarrange(acf_arima4,
+          pacf_arima4,
+          labels = c("ACF", "PACF"),
+          nrow = 2,
+          ncol= 1)
+```
+
+Dai correlogrammi dei residui del modello si osservano ritardi fuori dall'intervallo di confidenza, ma molto bassi rispetto ai precedenti ARIMA.
+
+Successivamente, si è costruito un modello con Regressione di Fourier, in modo da gestire la stagionalità annuale. Sono stati considerati tutti i parametri dei regressori precedenti, senza considerare la parte stagionale. Il modello considerato è costruito nel seguente modo: *ARIMA*$(3, 1, 2)_{24}$ con regressore di Fourier $K = 4$. I risultati sono convicenti, in quanto rispetto agli modelli ARIMA riesce ad identificare il trend e la stagionalità sui valori conosciuti.
+
+```{r Grafico Previsione ARIMAX, fig.cap = "Previsioni *ARIMA*$(3, 1, 2)_{24}$ con Regressione Fourier "}
+plot_val(pred_val5,
+         "Previsioni ARIMA(3, 1, 2) con Regressione Fourier")
+```
+
+## Previsione sul Modello Migliore
+Si presentano i valori della loss function applicata sia sul dataset di train sia sul dataset di validation. Il modello con funzione di perdita (**MAE**) minore sarà il candidato per il confronto dei dati di test, che non si conoscono:
+
+```{r MAE Arima}
+knitr::kable(mae_arima,
+             caption = "Mean Absolute Error Modelli Arima")
+```
+
+Il modello migliore è il seguente: *ARIMA*$(3, 1, 2)_{24}$ con regressione di Fourier. Il Test di Ljung-Box, tuttavia, rifiuta l'ipotesi di White Noise, in quanto essendo dati reali è difficile che possano rispettare la condizione. Si presenta il grafico raffigurante le previsioni sul Validation e sul Test. Sul Validation si osservano valori decrescenti dovuto alla situazione di inizio anno riguardo il *COVID-19*, di conseguenza non riesce a prevedere i valori dopo la fine del Lockdown durante i mesi di Marzo, Aprile e Maggio 2020. Le previsioni sul validation sono molto precise, infatti il modello riesce ad identificare bene sia il trend che la stagionalità.
+
+```{r Dynamic Plot ARIMA}
+dygraph(all_arima)                           %>%
+  dySeries("Reali",
+           label = "Reali")                  %>% #-- Train Dataset
+  dySeries("Previsione",
+           label = "Previsione")             %>% #-- Test Dataset
+  dySeries("Validation",
+           label = "Validation")             %>% #-- Validation Dataset
+  dyOptions(drawPoints = TRUE,                   #-- Draw Points
+            pointSize = 0.5,                     #-- Size of Points
+            colors = c("#0077b6",
+                       "#ad2e24",
+                       "#564e58"))           %>% #-- Colori
+  dyAxis("y", label = "Valore (in Milioni)") %>% #-- Asse Y
+  dyAxis("x", label = "Periodo",
+         drawGrid = FALSE)                   %>% #-- Asse X
+  dyRangeSelector(height = 20,
+                  dateWindow = c("2020-01-01 1:00:00",
+                                 "2020-10-31 1:00:00"))   %>% #-- Slider 
+  dyLegend(width = 350)     
+```
+
+# UCM
+Una serie storica può essere considerata come somma di componenti non osservabili, come trend, stagionalità e componente ciclica. I Modelli a Componenti non Osservabili, in inglese ***U***nobserved ***C***omoponents ***M***odels (**UCM**), selezionano le componenti stocastiche migliori dei modelli ARIMA, ma sono anche molto utili nelle previsioni.
+
+I modelli sviluppati sono i seguenti:
+
+* Local Linear Trend;
+* Local Linear Trend con Stagionalità *Dummy* Giornaliera;
+* Local Linear Trend con Stagionalità *Trigonometrica* Giornaliera;
+* Local Linear Trend con Stagionalità *Dummy* Giornaliera e Ciclo Annuale;
+* Random Walk con Stagionalità *Dummy* Giornaliera e *Ciclo* Annuale.
+
+Il *Trend* è responsabile della variazione della media del processo nel lungo periodo. Il Local Linear Trend migliora ogni volta che si aggiunge stagionalità giornaliera Dummy e ciclo annuale. Tuttavia, con la stagionalità trigonometrica prevede bene solo i primi giorni, ma con il passare delle ore i valori sono sottostimati.
+
+Si presentano i valori ia sul train che sul validation dei modelli a componenti non osservabili:
+
+```{r MAE UCM}
+knitr::kable(mae_ucm,
+             caption = "Mean Absolute Error Modelli UCM")
+```
+
+Il modello migliore è *Random Walk* con Stagionalità *Dummy* Giornaliera e *Ciclo* Annuale, con un valore della funzione di perdita nettamente minore sul validation rispetto agli altri local linear trend. 
+
+```{r Dynamic Plot UCM}
+dygraph(all_ucm)                             %>%
+  dySeries("Reali",
+           label = "Reali")                  %>% #-- Train Dataset
+  dySeries("Previsione",
+           label = "Previsione")             %>% #-- Test Dataset
+  dySeries("Validation",
+           label = "Validation")             %>% #-- Validation Dataset
+  dyOptions(drawPoints = TRUE,                   #-- Draw Points
+            pointSize = 0.5,                     #-- Size of Points
+            colors = c("#0077b6",
+                       "#ad2e24",
+                       "#564e58"))             %>% #-- Colori
+  dyAxis("y", label = "Valore (in Milioni)") %>% #-- Asse Y
+  dyAxis("x", label = "Periodo",
+         drawGrid = FALSE)                   %>% #-- Asse X
+  dyRangeSelector(height = 20,
+                  dateWindow = c("2020-01-01 1:00:00",
+                                 "2020-10-31 1:00:00")) %>% #-- Slider 
+  dyLegend(width = 350)                  
+```
+
+Il Random Walk riesce a prevedere sul validation l'inflessione dei valori durante il Lockdown, ma meno nei mesi successivi. La previsione sul Test Set vede un trend leggermente positivo.
+
+# Modelli Non Lineari
+Infine, per prevedere i valori sconosciuti negli ultimi due mesi sono stati applicati due diversi tipi di modelli non lineari:
+
+* K - Nearest Neighors
+* Recurrent Neural Network
+
+## K - Nearest Neighors
+Il primo algoritmo (K-NN) è stato applicato con un orizzonte di ricerca passata per individuare i k vicini sia giornaliero che settimanale, per individuare un particolare andamento durante la settimana. I parametri di vicinanza $k$ sono stati una sequenza di valori da 1 a 15 con un incremento di 2 $k$. Inoltre, è stato applicato il metodo ricorsivo in modo da avere una previsione all'ora successiva. Di conseguenza, ad ogni iterazione si considerano non solo tutti i valori della serie storica, ma anche quelli appena previsti. Il modello migliore risulta essere il modello knn con parametro $k = 15$ e con orizzonte di ricerca passata giornaliera.  Si presentano i le previsioni del modello sul dataset di Validation. 
+
+```{r Grafico Previsione KNN, fig.cap = "Previsioni K-NN con Lookback di Ricerca Giornaliera"}
+plot_val(pred_knn_day,
+         "Previsioni K-NN con Lookback di Ricerca Giornaliera")
+```
+
+## Recurrent Neural Network
+Sono stati costruiti 3 differenti modelli di Recurrent Neural Network:
+
+* ***L***ong ***S***hort ***T***erm ***M***emory (**LSTM**) con un layer di 16 neuroni ed un *Dropout* pari a 0.5 in modo da evitare l'overfitting dei dati;
+* ***L***ong ***S***hort ***T***erm ***M***emory (**LSTM**) con un layer di 16 neuroni, un *Dropout* di 0.5, un layer di 8 neuroni ed un *Dropout* di 0.5;
+* ***G***ate ***R***ecurrent ***U***nit (**GRU**) con un layer di 20 neuroni e *Dropout* pari a 0.3.
+
+Infine, per ognuno di essi è stato aggiunto un layer di strato denso con funzione di attivazione lineare. I modelli LSTM sono stati allenati per 10 epoche, mentre il modello GRU per 25 epoche. Inoltre, la funzione di ottimizzazione è Adam.
+
+Il batch size utilizzato ha un valori pari a 73: esso limita il numero di campioni da mostrare prima che una rete neurale venga allenata. Il periodo di lookback, ovvero l'orizzonte di ricerca passata, considerato è di una settimana. [^2]
+
+Le Reti Neurali ottengono funzioni di perdita con valori più bassi rispetto a tutti i precedenti modelli sviluppati. Si presentano le loss function sia sul train  che sul validation:
+
+```{r MAE ML}
+knitr::kable(mae_ml,
+             caption = "Mean Absolute Error Modelli Machine Learning")
+```
+
+Il modello migliore LSTM con due layer rispettivamente di 16 ed 8 neuroni. 
+```{r Dyn Plot ML}
+dygraph(all_ml)                              %>%
+  dySeries("Reali",
+           label = "Reali")                  %>% #-- Train Dataset
+  dySeries("Previsione",
+           label = "Previsione")             %>% #-- Test Dataset
+  dySeries("Validation",
+           label = "Validation")             %>% #-- Validation Dataset
+  dyOptions(drawPoints = TRUE,                   #-- Draw Points
+            pointSize = 0.5,                     #-- Size of Points
+            colors = c("#0077b6",
+                       "#ad2e24",
+                       "#564e58"))             %>% #-- Colori
+  dyAxis("y", label = "Valore (in Milioni)") %>% #-- Asse Y
+  dyAxis("x", label = "Periodo",
+         drawGrid = FALSE)                   %>% #-- Asse X
+  dyRangeSelector(height = 20,
+                  dateWindow = c("2020-01-01 1:00:00",
+                                 "2020-10-31 1:00:00")) %>% #-- Slider 
+  dyLegend(width = 350)                  
+```
+
+Si osserva che il dataset di validation prevede molto bene i valori reali. La serie storica relativa al dataset di Test mostra un incremento dei valori all'avanzare dei giorni
+
+# Confronto Modelli Finali
+Per valutare le performance dei modelli ARIMA, UCM e Machine Learning, si è deciso di confrontare tramite la metrica MAE quelli selezioni come migliori per ogni tipologia:
+
+* *ARIMA*$(3, 1, 2)_{24}$ con regressione di Fourier;
+* *Random Walk* con Stagionalità Dummy Giornaliera e Ciclo Annuale;
+* *LSTM* con un layer di 16 neuroni, un *Dropout* di 0.5, un layer di 8 neuroni ed un Dropout di 0.5.
+
+```{r MAE Best Model}
+mae_all <- rbind(mae_arima[4,],
+                 mae_ucm[5,],
+                 mae_ml[4,])
+
+rownames(mae_all) <- c("ARIMA(3,0,0)(0,1,2)",
+                       "RW + Sd + Ca",
+                       "LSTM 2 Layer")
+
+knitr::kable(mae_all,
+             caption = "Mean Absolute Error Migliori Modelli")
+```
+
+Il MAE sul validation con valore minore è relativo al modello *LSTM*, che batte con grande distacco gli altri due modelli migliori.
+
+Per le previsioni dei dati sconosciuti di Test sono stati riallenati i modelli considerando come dataset di Train l'intera serie storica. Si mostrano le previsioni dei dati tra i diversi modelli:
+
+```{r Dyn Best Models}
+dygraph(all)                                 %>%
+  dySeries("ARIMA",
+           label = "ARIMA")                  %>% #-- Train Dataset
+  dySeries("UCM",
+           label = "UCM")                    %>% #-- Test Dataset
+  dySeries("ML",
+           label = "ML")                     %>% #-- Validation Dataset
+  dyOptions(drawPoints = TRUE,                   #-- Draw Points
+            pointSize = 0.5,                     #-- Size of Points
+            colors = c("#0077b6",
+                       "#ad2e24",
+                       "#564e58"))             %>% #-- Colori
+  dyAxis("y", label = "Valore (in Milioni)") %>% #-- Asse Y
+  dyAxis("x", label = "Periodo",
+         drawGrid = FALSE)                   %>% #-- Asse X
+  dyRangeSelector(height = 20,
+                  dateWindow = c("2020-09-01 1:00:00",
+                                 "2020-09-08 1:00:00")) %>% #-- Slider 
+  dyLegend(width = 350)
+```
+
+Si osserva che i valori previsti dal modello ARIMA sono leggermente più alti rispetto agli altri, ma all'avanzare dei giorni i valori più alti appartengono al modello *LSTM*. Il modello UCM prevede i valori più bassi della serie storica.
+
+Il seguente grafico mostra i valori delle previsioni rispetto all'intera serie storica:
+
+```{r}
+all_train <- cbind(dyn_ts,
+                   dyn_pred_best_arima,
+                   dyn_pred_best_ucm,
+                   dyn_pred_best_ml)/1000000
+colnames(all_train) <- c("Train",
+                         "ARIMA",
+                         "UCM",
+                         "ML")
+
+dygraph(all_train)                                 %>%
+  dySeries("Train",
+           label = "Train")                  %>% #-- Train Dataset
+  dySeries("ARIMA",
+           label = "ARIMA")                  %>% #-- Train Dataset
+  dySeries("UCM",
+           label = "UCM")                    %>% #-- Test Dataset
+  dySeries("ML",
+           label = "ML")                     %>% #-- Validation Dataset
+  dyOptions(drawPoints = TRUE,                   #-- Draw Points
+            pointSize = 0.5,                     #-- Size of Points
+            colors = c("#ffa62b",
+                       "#0077b6",
+                       "#ad2e24",
+                       "#564e58"))             %>% #-- Colori
+  dyAxis("y", label = "Valore (in Milioni)") %>% #-- Asse Y
+  dyAxis("x", label = "Periodo",
+         drawGrid = FALSE)                   %>% #-- Asse X
+  dyRangeSelector(height = 20,
+                  dateWindow = c("2020-01-01 1:00:00",
+                                 "2020-10-31 1:00:00")) %>% #-- Slider 
+  dyLegend(width = 350)
+
+```
+
+
+[^1]: Hyndman, Athanasopoulos (2018) *Forecasting: Principles and Practice*.
+[^2]: [Select Batch Size](https://machinelearningmastery.com/use-different-batch-sizes-training-predicting-python-keras/)
